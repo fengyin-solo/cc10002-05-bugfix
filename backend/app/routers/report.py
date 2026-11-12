@@ -1,32 +1,70 @@
 """分析报告接口：维护报告模板，覆盖提交审核、生效发布、停用模板等动作。"""
 from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from fastapi import APIRouter, HTTPException, Query
-
+from app.filtering import QueryError
+from app.routers._export_support import (
+    collect_filters,
+    download_export,
+    get_artifact,
+    stream_export,
+    translate_query_error,
+)
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.report import ReportService
+from app.services.report import ALLOWED_STATUSES, ReportService
 
 router = APIRouter(prefix="/api/report", tags=["分析报告"])
 
 service = ReportService()
 
 LIST_FIELDS = ["模板编号", "模板名称", "包含指标", "报告周期", "图表模板", "导出格式", "推送渠道", "接收人列表"]
-STATUSES = ["草稿", "待审核", "已生效", "已停用"]
+STATUSES = list(ALLOWED_STATUSES)
+
+
+# 注意：所有 /export 开头的路由都必须声明在 /{entry_id} 之前，否则字面量
+# "export" 以及 artifacts 子路径会被当成整数明细编号解析，直接 422/404。
+# 数字明细访问仍由下面的 /{entry_id} 承接，老客户端的数字路径不受影响。
+@router.get("/export/artifacts/{snapshot_id}")
+def download_artifact(snapshot_id: str) :
+    """按快照标识补下载/重试：成功产物原样返回，失败记录给出可重试说明。"""
+    return get_artifact(snapshot_id)
+
+
+@router.get("/export")
+def export_entries(
+    request: Request,
+    status: str | None = Query(default=None, description="草稿、待审核、已生效、已停用"),
+    download: int = Query(default=0, description="1 时以附件文件下载，默认内联返回 JSON"),
+) :
+    """导出分析报告清单：承接页面当前检索范围，返回过滤后的全量结果而非当前页。"""
+    params = collect_filters(request, "report")
+    try:
+        payload = service.export_entries(params=params, status=status)
+        if download == 1:
+            return download_export(service, payload)
+        return stream_export(payload)
+    except QueryError as exc:
+        raise translate_query_error(exc)
 
 
 @router.get("", response_model=PageResult[dict])
 def list_entries(
-    keyword: str | None = Query(default=None, description="按模板编号检索"),
+    request: Request,
+    keyword: str | None = Query(default=None, description="按模板编号检索（历史别名）"),
     status: str | None = Query(default=None, description="草稿、待审核、已生效、已停用"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按模板编号与状态过滤分析报告列表；没有数据时返回空页，不报错。"""
-    if size > 200:
-        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    """按模板编号、名称等字段与状态过滤分析报告列表；没有数据时返回空页，不报错。"""
+    # collect_filters 已把历史 keyword 别名并入“模板编号”条件，列表与导出同口径。
+    params = collect_filters(request, "report")
+    try:
+        items, total = service.list_entries(
+            status=status, page=page, size=size, extra_filters=params
+        )
+    except QueryError as exc:
+        raise translate_query_error(exc)
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -56,10 +94,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出分析报告清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "report", "total": total, "items": items}

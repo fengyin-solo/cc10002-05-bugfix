@@ -1,32 +1,70 @@
 """数据导出接口：维护导出任务，覆盖提交执行、启动导出、终止导出、归档文件等动作。"""
 from __future__ import annotations
 
-from typing import Any
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from fastapi import APIRouter, HTTPException, Query
-
+from app.filtering import QueryError
+from app.routers._export_support import (
+    collect_filters,
+    download_export,
+    get_artifact,
+    stream_export,
+    translate_query_error,
+)
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.export import ExportService
+from app.services.export import ALLOWED_STATUSES, ExportService
 
 router = APIRouter(prefix="/api/export", tags=["数据导出"])
 
 service = ExportService()
 
 LIST_FIELDS = ["任务编号", "查询SQL", "导出格式", "字段列表", "分隔符", "编码格式", "压缩方式", "目标路径"]
-STATUSES = ["草稿", "待执行", "执行中", "已完成", "已失败"]
+STATUSES = list(ALLOWED_STATUSES)
+
+
+# 所有 /export 开头的路由都声明在 /{entry_id} 之前，避免字面量 "export" 与
+# artifacts 子路径被当成整数明细编号解析成 422/404；数字明细访问仍由
+# /{entry_id} 承接，老客户端的 /api/export/<数字> 不受影响。
+@router.get("/export/artifacts/{snapshot_id}")
+def download_artifact(snapshot_id: str) :
+    """按快照标识补下载/重试：成功产物原样返回，失败记录给出可重试说明。"""
+    return get_artifact(snapshot_id)
+
+
+@router.get("/export")
+def export_entries(
+    request: Request,
+    status: str | None = Query(default=None, description="草稿、待执行、执行中、已完成、已失败"),
+    download: int = Query(default=0, description="1 时以附件文件下载，默认内联返回 JSON"),
+) :
+    """导出数据导出清单：承接页面当前检索范围，返回过滤后的全量结果而非当前页。"""
+    params = collect_filters(request, "export")
+    try:
+        payload = service.export_entries(params=params, status=status)
+        if download == 1:
+            return download_export(service, payload)
+        return stream_export(payload)
+    except QueryError as exc:
+        raise translate_query_error(exc)
 
 
 @router.get("", response_model=PageResult[dict])
 def list_entries(
-    keyword: str | None = Query(default=None, description="按任务编号检索"),
+    request: Request,
+    keyword: str | None = Query(default=None, description="按任务编号检索（历史别名）"),
     status: str | None = Query(default=None, description="草稿、待执行、执行中、已完成、已失败"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按任务编号与状态过滤数据导出列表；没有数据时返回空页，不报错。"""
-    if size > 200:
-        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    """按任务编号、查询SQL等字段与状态过滤数据导出列表；没有数据时返回空页，不报错。"""
+    # collect_filters 已把历史 keyword 别名并入“任务编号”条件，列表与导出同口径。
+    params = collect_filters(request, "export")
+    try:
+        items, total = service.list_entries(
+            status=status, page=page, size=size, extra_filters=params
+        )
+    except QueryError as exc:
+        raise translate_query_error(exc)
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -56,10 +94,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出数据导出清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "export", "total": total, "items": items}

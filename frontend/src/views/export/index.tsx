@@ -97,7 +97,15 @@ export default function ExportView() {
           <button className="btn primary" type="button" onClick={() => setErrorMessage('导出任务登记入口尚未接入审批流')}>
             登记导出任务
           </button>
-          <button className="btn" type="button" onClick={() => window.open(`${ENDPOINT}/export`, '_blank')}>
+          <button
+            className="btn"
+            type="button"
+            onClick={() => {
+              // 导出承接当前检索条件：与列表同一个过滤口径，取全量快照而不是当前页
+              const query = new URLSearchParams(filters).toString()
+              window.open(`${ENDPOINT}/export?${query}`, '_blank')
+            }}
+          >
             导出数据导出清单
           </button>
         </div>
